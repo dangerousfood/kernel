@@ -5,6 +5,7 @@ pragma solidity ^0.8.26;
 import {RsaVerifyOptimized} from "../../lib/SolRsaVerify/src/RsaVerifyOptimized.sol";
 import {IValidator, IExecutor, IHook} from "../interfaces/IERC7579Modules.sol";
 import {PackedUserOperation} from "../interfaces/PackedUserOperation.sol";
+import "forge-std/console.sol";
 import {
     SIG_VALIDATION_SUCCESS_UINT,
     SIG_VALIDATION_FAILED_UINT,
@@ -18,14 +19,6 @@ import {MerchantRegistry} from "./MerchantRegistry.sol";
 import {EMVSettlement} from "./EMVSettlement.sol";
 import {ExecLib} from "../utils/ExecLib.sol";
 import {ExecMode, CallType} from "../types/Types.sol";
-
-// Simple IERC20 interface for transfers
-interface IERC20 {
-    function transfer(address to, uint256 amount) external returns (bool);
-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
-    function balanceOf(address account) external view returns (uint256);
-    function allowance(address owner, address spender) external view returns (uint256);
-}
 
 struct EMVTransactionData {
     bytes arqc;                 // 9F26 - Application Cryptogram (8 bytes)
@@ -53,8 +46,7 @@ contract EMVValidator is IValidator {
     // ========== EVENTS ==========
     
     event EMVSignatureValidated(address indexed kernel, bool success);
-    event UnpredictableNumberUsed(address indexed kernel, bytes4 unpredictableNumber);
-    event ATCIncremented(address indexed kernel, uint16 newATC);
+    event ReplayProtectionUpdated(address indexed kernel, bytes4 unpredictableNumber, uint16 newATC);
 
     // ========== STORAGE ==========
     
@@ -68,15 +60,13 @@ contract EMVValidator is IValidator {
     bytes4 public immutable selector;              // Expected function selector for validation
 
     // ========== ERRORS ==========
-    
-    error InvalidEMVDataLength(string field, uint256 expected, uint256 actual);
     error UnpredictableNumberAlreadyUsed(bytes4 unpredictableNumber);
     error InvalidATCSequence(uint16 expected, uint16 received);
     error InvalidCurrencyCode(uint16 currency);
     error InvalidConfig();
-    error ModuleNotInstalled();
     error InvalidTarget(address expected, address actual);
     error InvalidFunctionSelector(bytes4 expected, bytes4 actual);
+    error InvalidRSAKeySize(uint256 actualSize);
 
     // ========== CONSTRUCTOR ==========
     
@@ -154,25 +144,18 @@ contract EMVValidator is IValidator {
         // Validate that this EMV signature is being used for the correct target and function
         _validateTargetAndSelector(userOp.callData);
         
-        // Directly validate without external call to preserve msg.sender context
-        EMVTransactionData memory txnData = abi.decode(userOp.signature, (EMVTransactionData));
-        
+        // Gas-optimized validation using calldata extraction instead of full memory expansion
         // Validate currency code
-        _validateCurrencyCode(txnData);
-        
-        // Validate replay protection and ATC sequence
-        _validateReplayProtection(txnData);
+        _validateCurrencyCode(userOp.signature);
         
         // Verify RSA signature using PKCS#1 v1.5 with SHA-256
-        bool isValid = _verifyEMVSignature(txnData);
+        bool isValid = _verifyEMVSignature(userOp.signature);
         
         if (isValid) {
-            // Update state only if signature is valid
-            _updateTransactionState(txnData);
-            emit EMVSignatureValidated(msg.sender, true);
+            // Validate replay protection and update state together (both work with same data)
+            _validateReplayProtectionAndUpdateState(userOp.signature);
             return SIG_VALIDATION_SUCCESS_UINT;
         } else {
-            emit EMVSignatureValidated(msg.sender, false);
             return SIG_VALIDATION_FAILED_UINT;
         }
     }
@@ -189,7 +172,7 @@ contract EMVValidator is IValidator {
         override
         returns (bytes4)
     {
-        try this.verifyEMVSignatureView(sig) returns (bool success) {
+        try this.verifyEMVSignature(sig) returns (bool success) {
             if (success) {
                 return ERC1271_MAGICVALUE;
             }
@@ -200,61 +183,9 @@ contract EMVValidator is IValidator {
         return ERC1271_INVALID;
     }
 
-    /**
-     * @dev Main EMV CDA signature verification function
-     * @param emvData Encoded EMV transaction data
-     * @return true if signature is valid, false otherwise
-     */
-    function verifyEMVSignature(bytes calldata emvData) external returns (bool) {
-        EMVTransactionData memory txnData = abi.decode(emvData, (EMVTransactionData));
-        
-        // Validate currency code
-        _validateCurrencyCode(txnData);
-        
-        // Validate replay protection and ATC sequence
-        _validateReplayProtection(txnData);
-        
-        // Verify RSA signature
-        bool isValid = _verifyEMVSignature(txnData);
-        
-        if (isValid) {
-            // Update state only if signature is valid
-            _updateTransactionState(txnData);
-        }
-        
-        emit EMVSignatureValidated(msg.sender, isValid);
-        return isValid;
+    function verifyEMVSignature(bytes calldata signature) external view returns (bool) {
+        return _verifyEMVSignature(signature);
     }
-
-    /**
-     * @dev View-only EMV CDA signature verification (no state changes)
-     * @param emvData Encoded EMV transaction data
-     * @return true if signature is valid, false otherwise
-     */
-    function verifyEMVSignatureView(bytes calldata emvData) external view returns (bool) {
-        EMVTransactionData memory txnData = abi.decode(emvData, (EMVTransactionData));
-        EMVValidatorStorage storage accountStorage = emvValidatorStorage[msg.sender];
-        
-        // Validate currency code
-        _validateCurrencyCode(txnData);
-        
-        // Check unpredictable number hasn't been used
-        uint32 unpredictableNumber = uint32(bytes4(txnData.unpredictableNumber));
-        if (accountStorage.usedUnpredictableNumbers[unpredictableNumber]) {
-            return false; // Already used
-        }
-        
-        // Check ATC sequence
-        uint16 receivedATC = uint16(bytes2(txnData.atc));
-        if (receivedATC != accountStorage.expectedATC) {
-            return false; // Invalid sequence
-        }
-        
-        // Verify RSA signature
-        return _verifyEMVSignature(txnData);
-    }
-
-
 
     /**
      * @dev Get the configured target and selector
@@ -317,98 +248,160 @@ contract EMVValidator is IValidator {
         }
     }
     
+    // ========== GAS-OPTIMIZED CALLDATA EXTRACTION ==========
+    
+    
+    /**
+     * @dev Extract unpredictable number (4 bytes) from packed signature - Assembly optimized
+     */
+    function _extractUnpredictableNumber(bytes calldata signature) internal pure returns (bytes4 result) {
+        assembly {
+            result := calldataload(add(signature.offset, 8))
+        }
+    }
+    
+    /**
+     * @dev Extract ATC (2 bytes) from packed signature - Assembly optimized
+     */
+    function _extractATC(bytes calldata signature) internal pure returns (bytes2 result) {
+        assembly {
+            result := calldataload(add(signature.offset, 12))
+        }
+    }
+    
+    /**
+     * @dev Extract currency (2 bytes) from packed signature - Assembly optimized
+     */
+    function _extractCurrency(bytes calldata signature) internal pure returns (bytes2 result) {
+        assembly {
+            result := calldataload(add(signature.offset, 20))
+        }
+    }
+    
 
     /**
      * @dev Validate currency code (must be 840 USD or 997 USN)
-     * @param txnData Transaction data to validate
+     * @param signature The signature calldata to extract currency from
      */
-    function _validateCurrencyCode(EMVTransactionData memory txnData) internal pure {
+    function _validateCurrencyCode(bytes calldata signature) internal pure {
         // Currency is stored as 2 bytes big-endian
-        uint16 currency = uint16(bytes2(txnData.currency));
+        bytes2 currencyBytes = _extractCurrency(signature);
+        uint16 currency = uint16(currencyBytes);
         if (currency != 840 && currency != 997) {
             revert InvalidCurrencyCode(currency);
         }
     }
     
     /**
-     * @dev Validate replay protection and ATC sequence
-     * @param txnData Transaction data to validate
+     * @dev Validate replay protection and update transaction state in one operation - Storage optimized
+     * @param signature The signature calldata to extract data from
      */
-    function _validateReplayProtection(EMVTransactionData memory txnData) internal view {
-        EMVValidatorStorage storage accountStorage = emvValidatorStorage[msg.sender];
+    function _validateReplayProtectionAndUpdateState(bytes calldata signature) internal {
+        // Extract values using assembly for efficiency
+        bytes4 unpredictableNumberBytes;
+        bytes2 atcBytes;
+        assembly {
+            unpredictableNumberBytes := calldataload(add(signature.offset, 8))
+            atcBytes := calldataload(add(signature.offset, 12))
+        }
         
-        // Check unpredictable number hasn't been used
-        uint32 unpredictableNumber = uint32(bytes4(txnData.unpredictableNumber));
+        uint32 unpredictableNumber = uint32(unpredictableNumberBytes);
+        uint16 receivedATC = uint16(atcBytes);
+        
+        // Load storage once and cache the slot
+        EMVValidatorStorage storage accountStorage = emvValidatorStorage[msg.sender];
+        uint16 currentATC = accountStorage.expectedATC;
+        
+        // Validate replay protection
         if (accountStorage.usedUnpredictableNumbers[unpredictableNumber]) {
-            revert UnpredictableNumberAlreadyUsed(bytes4(txnData.unpredictableNumber));
+            revert UnpredictableNumberAlreadyUsed(unpredictableNumberBytes);
         }
         
-        // Check ATC sequence
-        uint16 receivedATC = uint16(bytes2(txnData.atc));
-        if (receivedATC != accountStorage.expectedATC) {
-            revert InvalidATCSequence(accountStorage.expectedATC, receivedATC);
+        if (receivedATC != currentATC) {
+            revert InvalidATCSequence(currentATC, receivedATC);
         }
-    }
-    
-    /**
-     * @dev Update transaction state after successful validation
-     * @param txnData Transaction data that was validated
-     */
-    function _updateTransactionState(EMVTransactionData memory txnData) internal {
-        EMVValidatorStorage storage accountStorage = emvValidatorStorage[msg.sender];
         
-        // Mark unpredictable number as used
-        uint32 unpredictableNumber = uint32(bytes4(txnData.unpredictableNumber));
+        // Update state after validation passes (batch storage writes)
         accountStorage.usedUnpredictableNumbers[unpredictableNumber] = true;
+        accountStorage.expectedATC = currentATC + 1;
         
-        // Increment expected ATC
-        accountStorage.expectedATC++;
-        
-        // Emit events
-        emit UnpredictableNumberUsed(msg.sender, bytes4(txnData.unpredictableNumber));
-        emit ATCIncremented(msg.sender, accountStorage.expectedATC);
+        // Emit combined event
+        emit ReplayProtectionUpdated(msg.sender, unpredictableNumberBytes, currentATC + 1);
     }
 
+
+
+
     /**
-     * @dev Assemble EMV dynamic data according to Book 2, Annex C.5 (Signed Data Format 3)
-     * Format: header(0x6A) + format(0x03) + ARQC + UnpredictableNumber + ATC + 
-     *         Amount + Currency + Date + TxnType + TVR + CVMResults + TerminalId + MerchantId + trailer(0xBC)
+     * @dev Assemble EMV dynamic data directly from calldata
+     * @param signature The signature calldata to extract fields from
+     * @return dynamicData The assembled dynamic data for signature verification
      */
-    function _assembleDynamicData(EMVTransactionData memory txnData) internal pure returns (bytes memory) {
+    function _assembleDynamicData(bytes calldata signature) internal pure returns (bytes memory dynamicData) {
+        // Extract all 11 EMV fields as one continuous slice from packed data
+        // Fields are now packed: ARQC(8) + UnpredictableNumber(4) + ATC(2) + Amount(6) + Currency(2) + Date(3) + TxnType(1) + TVR(5) + CVMResults(3) + TerminalId(8) + MerchantId(15) = 57 bytes
+        bytes calldata allFieldBytes = signature[0:57]; // Extract first 57 bytes which contain all EMV fields
+        
+        // Assemble according to EMV Book 2, Annex C.5 (Signed Data Format 3)
         return abi.encodePacked(
-            bytes1(0x6A),                    // Header
-            bytes1(0x03),                    // Format (Signed Data Format 3)
-            txnData.arqc,                    // 9F26 - ARQC (8 bytes)
-            txnData.unpredictableNumber,     // 9F37 - Unpredictable Number (4 bytes)
-            txnData.atc,                     // 9F36 - ATC (2 bytes)
-            txnData.amount,                  // 9F02 - Amount (6 bytes BCD)
-            txnData.currency,                // 5F2A - Currency (2 bytes)
-            txnData.date,                    // 9A - Date (3 bytes BCD)
-            txnData.txnType,                 // 9C - Transaction Type (1 byte)
-            txnData.tvr,                     // 95 - TVR (5 bytes)
-            txnData.cvmResults,              // 9F34 - CVM Results (3 bytes)
-            txnData.terminalId,              // 9F1C - Terminal ID (8 bytes)
-            txnData.merchantId,              // 9F16 - Merchant ID (15 bytes)
-            bytes1(0xBC)                     // Trailer
+            bytes1(0x6A),          // Header
+            bytes1(0x03),          // Format (Signed Data Format 3)
+            allFieldBytes,         // All 11 fields as one slice (57 bytes)
+            bytes1(0xBC)           // Trailer
         );
     }
 
     /**
      * @dev Verify EMV RSA signature using PKCS#1 v1.5 with SHA-256
-     * @param txnData Transaction data containing signature and keys
+     * @param signature The signature calldata containing all EMV transaction data
      * @return true if signature is valid, false otherwise
      */
-    function _verifyEMVSignature(EMVTransactionData memory txnData) internal view returns (bool) {
-        // Assemble dynamic data according to EMV Book 2, Annex C.5 (Signed Data Format 3)
-        bytes memory dynamicData = _assembleDynamicData(txnData);
+    function _verifyEMVSignature(bytes calldata signature) internal view returns (bool) {
+        // Assemble dynamic data directly from calldata
+        bytes memory dynamicData = _assembleDynamicData(signature);
+        
+        // Extract signature and key components from packed data
+        uint256 emvFieldsLength = 57; // All EMV fields
+        
+        // Calculate modulus length first to determine signature length
+        // Total length - EMV fields - exponent(3) = signature + modulus
+        uint256 sigAndModulusLength = signature.length - emvFieldsLength - 3;
+        
+        // For RSA-2048: signature(256) + modulus(256) = 512 bytes
+        // For RSA-1024: signature(128) + modulus(128) = 256 bytes  
+        uint256 modulusLength;
+        uint256 sigLength;
+        
+        if (sigAndModulusLength == 512) {
+            // RSA-2048
+            sigLength = 256;
+            modulusLength = 256;
+        } else if (sigAndModulusLength == 256) {
+            // RSA-1024 - block this
+            revert InvalidRSAKeySize(128);
+        } else {
+            // Invalid signature format
+            revert InvalidRSAKeySize(sigAndModulusLength / 2);
+        }
+        
+        bytes calldata sigBytes = signature[emvFieldsLength:emvFieldsLength + sigLength];
+        
+        // Exponent starts after signature (always 3 bytes)
+        uint256 expStart = emvFieldsLength + sigLength;
+        bytes calldata exponent = signature[expStart:expStart + 3];
+        
+        // Modulus starts after exponent
+        uint256 modStart = expStart + 3;
+        bytes calldata modulus = signature[modStart:modStart + modulusLength];
         
         // Verify RSA signature using PKCS#1 v1.5 with SHA-256
         return RsaVerifyOptimized.pkcs1Sha256Raw(
             dynamicData,
-            txnData.signature,
-            txnData.exponent,
-            txnData.modulus
+            sigBytes,
+            exponent,
+            modulus
         );
     }
+
 
 }

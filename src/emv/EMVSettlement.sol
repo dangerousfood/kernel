@@ -7,7 +7,7 @@ import {IExecutor} from "../interfaces/IERC7579Modules.sol";
 import {
     MODULE_TYPE_EXECUTOR
 } from "../types/Constants.sol";
-import {EMVTransactionData, IERC20} from "./EMVValidator.sol";
+import {EMVTransactionData} from "./EMVValidator.sol";
 import {SafeTransferLib} from "lib/solady/src/utils/SafeTransferLib.sol";
 
 /**
@@ -53,13 +53,10 @@ contract EMVSettlement is IExecutor {
 
     // ========== ERRORS ==========
     
-    error TransferFailed();
     error InvalidAmount();
-    error TokenNotConfigured();
     error MerchantNotRegistered(bytes15 merchantId);
     error MerchantRegistryNotSet();
     error InvalidConfig();
-    error ModuleNotInstalled();
     error InvalidDecimals();
 
 
@@ -103,38 +100,31 @@ contract EMVSettlement is IExecutor {
 
     /**
      * @dev Main entry point: Execute EMV-based ERC20 transfer using validated EMV data
-     * @param emvData Encoded EMV transaction data (should be same as from UserOp signature)
+     * @param emvData Packed EMV transaction data (should be same as from UserOp signature)
      */
     function execute(bytes calldata emvData) external payable {
-        // Decode EMV transaction data
-        EMVTransactionData memory txnData = abi.decode(emvData, (EMVTransactionData));
+        // Extract only the fields we need directly from packed data
+        // Amount is at offset 14: ARQC(8) + UnpredictableNumber(4) + ATC(2) = 14
+        bytes calldata amountBytes = emvData[14:20]; // 6 bytes for amount
+        
+        // MerchantId is at offset 42: ARQC(8) + UnpredictableNumber(4) + ATC(2) + Amount(6) + Currency(2) + Date(3) + TxnType(1) + TVR(5) + CVMResults(3) + TerminalId(8) = 42
+        bytes15 merchantId = bytes15(emvData[42:57]); // 15 bytes for merchantId
 
         // Extract amount from EMV BCD format (6 bytes) using immutable decimals
-        uint256 transferAmount = _extractAmountFromBCD(txnData.amount, decimals);
+        uint256 transferAmount = _extractAmountFromBCD(amountBytes, decimals);
 
         if (transferAmount == 0) {
             revert InvalidAmount();
         }
         
-        bytes15 merchantId = bytes15(txnData.merchantId);
         address recipient = merchantRegistry.getMerchantAddress(merchantId);
         
         if (recipient == address(0)) {
-            revert MerchantNotRegistered(bytes15(txnData.merchantId));
+            revert MerchantNotRegistered(merchantId);
         }
 
         // Execute ERC20 transfer (in delegate call context, address(this) is the kernel)
-        SafeTransferLib.safeTransfer(configuredToken,recipient, transferAmount);
-
-        // Emit event with EMV details
-        emit EMVTransferExecuted(
-            address(this), // In delegate call context, address(this) is the kernel
-            recipient,
-            configuredToken,
-            transferAmount,
-            bytes4(txnData.unpredictableNumber),
-            uint16(bytes2(txnData.atc))
-        );
+        SafeTransferLib.safeTransfer(configuredToken, recipient, transferAmount);
     }
 
 
@@ -159,7 +149,7 @@ contract EMVSettlement is IExecutor {
      * @param tokenDecimals Number of decimals for the token
      * @return Amount in token units based on provided decimals
      */
-    function _extractAmountFromBCD(bytes memory bcdAmount, uint8 tokenDecimals) internal pure returns (uint256) {
+    function _extractAmountFromBCD(bytes calldata bcdAmount, uint8 tokenDecimals) internal pure returns (uint256) {
         if (bcdAmount.length != 6) {
             return 0;
         }
