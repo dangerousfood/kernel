@@ -63,13 +63,21 @@ contract EMVValidatorTest is KernelTestBase {
         merchantAddress = makeAddr("merchant");
         
         // Register test merchant
-        merchantRegistry.modifyMerchant(bytes15(TEST_MERCHANT_ID), merchantAddress);
+        MerchantRegistry.PaymentRecipient[] memory recipients = new MerchantRegistry.PaymentRecipient[](1);
+        recipients[0] = MerchantRegistry.PaymentRecipient({
+            recipient: merchantAddress,
+            basisPoints: 10000  // 100% to merchant
+        });
+        merchantRegistry.setMerchantPayments(bytes15(TEST_MERCHANT_ID), recipients);
         
         // Deploy settlement contract with configuration
         emvSettlement = new EMVSettlement(
             address(mockERC20),        // token address
             address(merchantRegistry), // merchant registry address  
-            18                         // token decimals
+            18,                        // token decimals
+            250,                       // network fee rate (2.5% in basis points)
+            address(this),             // network fee recipient
+            address(this)              // owner
         );
         
         // Deploy EMV validator with target and selector
@@ -576,14 +584,20 @@ contract EMVValidatorTest is KernelTestBase {
         address testMerchantAddress = address(0x789);
         
         // Register merchant
-        merchantRegistry.modifyMerchant(merchantId, testMerchantAddress);
+        MerchantRegistry.PaymentRecipient[] memory recipients = new MerchantRegistry.PaymentRecipient[](1);
+        recipients[0] = MerchantRegistry.PaymentRecipient({
+            recipient: testMerchantAddress,
+            basisPoints: 10000  // 100% to merchant
+        });
+        merchantRegistry.setMerchantPayments(merchantId, recipients);
         
         // Check registration
         assertTrue(merchantRegistry.isMerchantRegistered(merchantId));
         assertEq(merchantRegistry.getMerchantAddress(merchantId), testMerchantAddress);
         
-        // Test removal by setting address to address(0)
-        merchantRegistry.modifyMerchant(merchantId, address(0));
+        // Test removal by setting empty recipients array
+        MerchantRegistry.PaymentRecipient[] memory emptyRecipients = new MerchantRegistry.PaymentRecipient[](0);
+        merchantRegistry.setMerchantPayments(merchantId, emptyRecipients);
         assertFalse(merchantRegistry.isMerchantRegistered(merchantId));
         assertEq(merchantRegistry.getMerchantAddress(merchantId), address(0));
     }

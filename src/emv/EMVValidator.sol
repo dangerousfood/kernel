@@ -15,7 +15,6 @@ import {
     ERC1271_MAGICVALUE,
     ERC1271_INVALID
 } from "../types/Constants.sol";
-import {MerchantRegistry} from "./MerchantRegistry.sol";
 import {EMVSettlement} from "./EMVSettlement.sol";
 import {ExecLib} from "../utils/ExecLib.sol";
 import {ExecMode, CallType} from "../types/Types.sol";
@@ -45,7 +44,6 @@ struct EMVTransactionData {
 contract EMVValidator is IValidator {
     // ========== EVENTS ==========
     
-    event EMVSignatureValidated(address indexed kernel, bool success);
     event ReplayProtectionUpdated(address indexed kernel, bytes4 unpredictableNumber, uint16 newATC);
 
     // ========== STORAGE ==========
