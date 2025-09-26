@@ -27,7 +27,7 @@ kernel.installModule(MODULE_TYPE_VALIDATOR, address(emvValidator), installData);
 ### 2. UserOp Construction
 
 ```solidity
-// EMV data from card transaction (updated with Terminal ID and Merchant ID)
+// EMV data from card transaction (updated with Terminal ID, Merchant ID, and Acquirer ID)
 EMVTransactionData memory emvData = EMVTransactionData({
     arqc: hex"1234567890ABCDEF",           // 9F26 - Application Cryptogram (8 bytes)
     unpredictableNumber: hex"12345678",    // 9F37 - Terminal random (4 bytes)
@@ -40,6 +40,7 @@ EMVTransactionData memory emvData = EMVTransactionData({
     cvmResults: hex"000000",               // 9F34 - CVM results (3 bytes)
     terminalId: hex"5445535430303100",     // 9F1C - Terminal ID (8 bytes) "TEST001"
     merchantId: hex"4D45524348414E5430303132333400", // 9F16 - Merchant ID (15 bytes) "MERCHANT001234"
+    acquirerId: hex"414351554952",         // 9F01 - Acquirer ID (6 bytes) "ACQUIR"
     signature: rsaSignature,               // 9F4B - EMV signature
     exponent: hex"010001",                 // RSA public key exponent
     modulus: issuerModulus                 // RSA public key modulus

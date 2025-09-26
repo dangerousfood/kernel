@@ -2,7 +2,7 @@
 
 pragma solidity ^0.8.26;
 
-import {MerchantRegistry} from "./MerchantRegistry.sol";
+import {AcquirerConfig} from "./AcquirerConfig.sol";
 import {
     MODULE_TYPE_EXECUTOR
 } from "../types/Constants.sol";
@@ -22,17 +22,13 @@ contract EMVSettlement is Ownable {
         address indexed from,
         address indexed to,
         address indexed token,
-        uint256 amount,
-        bytes4 unpredictableNumber,
-        uint16 atc
+        uint256 amount
     );
     
     event EMVMultiTransferExecuted(
         address indexed from,
         address indexed token,
         uint256 totalAmount,
-        bytes4 unpredictableNumber,
-        uint16 atc,
         uint256 recipientCount
     );
     event EMVSettlementConfigured(address indexed account, address token, address recipient);
@@ -42,24 +38,18 @@ contract EMVSettlement is Ownable {
     
     // Immutable configuration - accessible in both regular call and delegate call contexts
     address public immutable configuredToken;      // ERC20 token address for this settlement instance
-    MerchantRegistry public immutable merchantRegistry; // Registry for merchant address validation
+    AcquirerConfig public immutable acquirerConfig; // Registry for merchant address validation
     uint8 public immutable decimals;                   // Token decimals for amount conversion
-    uint256 public immutable networkFeeRate;             // Network fee rate in basis points (e.g., 250 = 2.5%)
-    
-    // Mutable configuration
-    address public networkFeeRecipient;                 // Address to receive network fees
 
     // ========== CONSTRUCTOR ==========
     
     constructor(
         address _tokenAddress, 
-        address _merchantRegistryAddress, 
+        address _acquirerConfigAddress, 
         uint8 _decimals, 
-        uint256 _networkFeeRateBasisPoints,
-        address _networkFeeRecipient,
         address _owner
     ) {
-        if (_tokenAddress == address(0) || _merchantRegistryAddress == address(0)) {
+        if (_tokenAddress == address(0) || _acquirerConfigAddress == address(0)) {
             revert InvalidConfig();
         }
         
@@ -67,20 +57,9 @@ contract EMVSettlement is Ownable {
             revert InvalidDecimals();
         }
         
-        if (_networkFeeRateBasisPoints > 10000) {
-            revert InvalidNetworkFeeRate();
-        }
-        
         configuredToken = _tokenAddress;
-        merchantRegistry = MerchantRegistry(_merchantRegistryAddress);
+        acquirerConfig = AcquirerConfig(_acquirerConfigAddress);
         decimals = _decimals;
-        
-        // Store basis points directly - we'll calculate the actual fee during execution
-        // This preserves precision and allows proper percentage calculation
-        // Example: 250 basis points = 2.5%
-        networkFeeRate = _networkFeeRateBasisPoints;
-        
-        networkFeeRecipient = _networkFeeRecipient;
         
         // Initialize Ownable
         _initializeOwner(_owner);
@@ -96,6 +75,9 @@ contract EMVSettlement is Ownable {
     error InvalidNetworkFeeRate();
     error InvalidNetworkFeeRecipient();
     error TotalTransfersExceedAmount();
+    error InvalidFee(uint256 position);
+    error InvalidMerchantFee();
+    error BelowTransactionMinimum();
 
 
 
@@ -131,7 +113,7 @@ contract EMVSettlement is Ownable {
      */
     function isInitialized(address smartAccount) external view returns (bool) {
         // Configuration is immutable and set in constructor, so always initialized
-        return configuredToken != address(0) && address(merchantRegistry) != address(0) && decimals >= 2;
+        return configuredToken != address(0) && address(acquirerConfig) != address(0) && decimals >= 2;
     }
 
     // ========== SETTLEMENT FUNCTIONS ==========
@@ -145,8 +127,14 @@ contract EMVSettlement is Ownable {
         // Amount is at offset 14: ARQC(8) + UnpredictableNumber(4) + ATC(2) = 14
         bytes calldata amountBytes = emvData[14:20]; // 6 bytes for amount
         
+        // TerminalId is at offset 34: ARQC(8) + UnpredictableNumber(4) + ATC(2) + Amount(6) + Currency(2) + Date(3) + TxnType(1) + TVR(5) + CVMResults(3) = 34
+        uint64 terminalId = uint64(bytes8(emvData[34:42])); // 8 bytes for terminalId converted to uint64
+        
         // MerchantId is at offset 42: ARQC(8) + UnpredictableNumber(4) + ATC(2) + Amount(6) + Currency(2) + Date(3) + TxnType(1) + TVR(5) + CVMResults(3) + TerminalId(8) = 42
-        bytes15 merchantId = bytes15(emvData[42:57]); // 15 bytes for merchantId
+        uint120 merchantId = uint120(bytes15(emvData[42:57])); // 15 bytes for merchantId converted to uint120
+        
+        // AcquirerId is at offset 57: ARQC(8) + UnpredictableNumber(4) + ATC(2) + Amount(6) + Currency(2) + Date(3) + TxnType(1) + TVR(5) + CVMResults(3) + TerminalId(8) + MerchantId(15) = 57
+        uint48 acquirerId = uint48(bytes6(emvData[57:63])); // 6 bytes for acquirerId converted to uint48
 
         // Extract amount from EMV BCD format (6 bytes) using immutable decimals
         uint256 transferAmount = _extractAmountFromBCD(amountBytes, decimals);
@@ -155,39 +143,12 @@ contract EMVSettlement is Ownable {
             revert InvalidAmount();
         }
         
-        // Get payment recipients from merchant registry
-        MerchantRegistry.PaymentRecipient[] memory recipients = merchantRegistry.getMerchantPayments(merchantId);
-        
-        if (recipients.length == 0) {
-            revert MerchantNotRegistered(merchantId);
-        }
-
-        // Expand recipients array by one using Yul to add network fee recipient
-        if (networkFeeRate > 0 && networkFeeRecipient != address(0)) {
-            assembly {
-                // Load current length
-                let len := mload(recipients)
-                
-                // Compute pointer for new element (each PaymentRecipient is 64 bytes = 0x40)
-                let newElemPtr := add(add(recipients, 0x20), mul(len, 0x40))
-                
-                // Increase length by 1
-                mstore(recipients, add(len, 1))
-            }
-            
-            // Add network fee recipient in Solidity
-            recipients[recipients.length - 1] = MerchantRegistry.PaymentRecipient({
-                recipient: networkFeeRecipient,
-                basisPoints: networkFeeRate
-            });
-        }
-
-        // Extract unpredictable number and ATC for events
-        bytes4 unpredictableNumber = bytes4(emvData[8:12]);
-        uint16 atc = uint16(bytes2(emvData[12:14]));
+        // Get payment distribution from acquirer config (includes all 4 fees + merchant)
+        AcquirerConfig.FeeRecipient[] memory feeRecipients = 
+            acquirerConfig.calculatePaymentDistribution(merchantId, terminalId, acquirerId, transferAmount);
         
         // Process payments to all recipients
-        _processMultiplePayments(recipients, transferAmount, unpredictableNumber, atc);
+        _processFeePayments(feeRecipients, transferAmount);
     }
 
 
@@ -195,79 +156,54 @@ contract EMVSettlement is Ownable {
     // ========== CONFIGURATION FUNCTIONS ==========
 
     /**
-     * @dev Get the configured token, merchant registry, and decimals
+     * @dev Get the configured token, acquirer config, and decimals
      * @return tokenAddress The configured ERC20 token address
-     * @return registry The merchant registry address
+     * @return configAddress The acquirer config address
      * @return tokenDecimals The configured token decimals
      */
-    function getSettlementConfig() external view returns (address tokenAddress, address registry, uint8 tokenDecimals) {
-        return (configuredToken, address(merchantRegistry), decimals);
-    }
-    
-    /**
-     * @dev Set the network fee recipient address (only owner)
-     * @param _newRecipient New network fee recipient address
-     */
-    function setNetworkFeeRecipient(address _newRecipient) external onlyOwner {
-        if (_newRecipient == address(0)) {
-            revert InvalidNetworkFeeRecipient();
-        }
-        
-        address oldRecipient = networkFeeRecipient;
-        networkFeeRecipient = _newRecipient;
-        
-        emit NetworkFeeRecipientUpdated(oldRecipient, _newRecipient);
-    }
-    
-    /**
-     * @dev Get the network fee rate for validation purposes
-     * @return The network fee rate in basis points
-     */
-    function getNetworkFeeRate() external view returns (uint256) {
-        return networkFeeRate;
+    function getSettlementConfig() external view returns (address tokenAddress, address configAddress, uint8 tokenDecimals) {
+        return (configuredToken, address(acquirerConfig), decimals);
     }
 
     // ========== INTERNAL FUNCTIONS ==========
 
     /**
-     * @dev Process payments to multiple recipients (including network fee as last recipient)
-     * @param recipients Array of payment recipients with basis points (network fee included if applicable)
-     * @param totalAmount Total amount to distribute
-     * @param unpredictableNumber EMV unpredictable number for events
-     * @param atc EMV application transaction counter for events
+     * @dev Process payments to fee recipients including fees and merchant remainder
+     * @param feeRecipients Array of fee recipients with calculated amounts
+     * @param totalAmount Total transaction amount
      */
-    function _processMultiplePayments(
-        MerchantRegistry.PaymentRecipient[] memory recipients,
-        uint256 totalAmount,
-        bytes4 unpredictableNumber,
-        uint16 atc
+    function _processFeePayments(
+        AcquirerConfig.FeeRecipient[] memory feeRecipients,
+        uint256 totalAmount
     ) internal {
-        uint256 totalTransferred = 0;
+        uint256 totalFees = 0;
         
-        // Distribute to each recipient based on their basis points from the total amount
-        for (uint256 i = 0; i < recipients.length; i++) {
-            uint256 recipientAmount = (totalAmount * recipients[i].basisPoints) / 10000;
+        // Process all fees (excluding merchant)
+        uint256 i = 0;
+        for (; i < feeRecipients.length - 1;) {
+            // Validate non-merchant fees are non-zero
+            if (feeRecipients[i].fee == 0) revert InvalidFee(i);
             
-            if (recipientAmount > 0) {
-                totalTransferred += recipientAmount;
-                SafeTransferLib.safeTransfer(configuredToken, recipients[i].recipient, recipientAmount);
+            uint256 feeAmount = feeRecipients[i].fee;
+            totalFees += feeAmount;
+            
+            SafeTransferLib.safeTransfer(configuredToken, feeRecipients[i].recipient, feeAmount);
+            unchecked {
+                ++i;
             }
         }
- 
-        if (totalTransferred > totalAmount) {
-            revert TotalTransfersExceedAmount();
+        
+        // Check if total fees exceed or equal transaction amount
+        if (totalFees >= totalAmount) revert BelowTransactionMinimum();
+        
+        // Handle merchant payment (last recipient, fee must be 0)
+        // i should now point to the last element (merchant)
+        if (feeRecipients[i].fee != 0) revert InvalidMerchantFee();
+        
+        uint256 merchantAmount = totalAmount - totalFees;
+        if (merchantAmount > 0) {
+            SafeTransferLib.safeTransfer(configuredToken, feeRecipients[i].recipient, merchantAmount);
         }
-    }
-    
-    /**
-     * @dev Calculate network fee for a given amount
-     * @param amount The amount to calculate fee for
-     * @return The network fee amount
-     */
-    function _calculateNetworkFee(uint256 amount) internal view returns (uint256) {
-        // Calculate fee: (amount * networkFeeRate) / 10000
-        // This preserves precision by doing multiplication first
-        return (amount * networkFeeRate) / 10000;
     }
 
     /**

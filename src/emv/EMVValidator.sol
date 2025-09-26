@@ -31,6 +31,7 @@ struct EMVTransactionData {
     bytes cvmResults;           // 9F34 - 3 bytes CVM Results
     bytes terminalId;           // 9F1C - Terminal ID (8 bytes)
     bytes merchantId;           // 9F16 - Merchant ID (15 bytes)
+    bytes acquirerId;           // 9F01 - Acquirer ID (6 bytes)
     bytes signature;            // 9F4B - RSA signature
     bytes exponent;             // RSA public key exponent
     bytes modulus;              // RSA public key modulus
@@ -336,15 +337,15 @@ contract EMVValidator is IValidator {
      * @return dynamicData The assembled dynamic data for signature verification
      */
     function _assembleDynamicData(bytes calldata signature) internal pure returns (bytes memory dynamicData) {
-        // Extract all 11 EMV fields as one continuous slice from packed data
-        // Fields are now packed: ARQC(8) + UnpredictableNumber(4) + ATC(2) + Amount(6) + Currency(2) + Date(3) + TxnType(1) + TVR(5) + CVMResults(3) + TerminalId(8) + MerchantId(15) = 57 bytes
-        bytes calldata allFieldBytes = signature[0:57]; // Extract first 57 bytes which contain all EMV fields
+        // Extract all 12 EMV fields as one continuous slice from packed data
+        // Fields are now packed: ARQC(8) + UnpredictableNumber(4) + ATC(2) + Amount(6) + Currency(2) + Date(3) + TxnType(1) + TVR(5) + CVMResults(3) + TerminalId(8) + MerchantId(15) + AcquirerId(6) = 63 bytes
+        bytes calldata allFieldBytes = signature[0:63]; // Extract first 63 bytes which contain all EMV fields
         
         // Assemble according to EMV Book 2, Annex C.5 (Signed Data Format 3)
         return abi.encodePacked(
             bytes1(0x6A),          // Header
             bytes1(0x03),          // Format (Signed Data Format 3)
-            allFieldBytes,         // All 11 fields as one slice (57 bytes)
+            allFieldBytes,         // All 12 fields as one slice (63 bytes)
             bytes1(0xBC)           // Trailer
         );
     }
@@ -359,7 +360,7 @@ contract EMVValidator is IValidator {
         bytes memory dynamicData = _assembleDynamicData(signature);
         
         // Extract signature and key components from packed data
-        uint256 emvFieldsLength = 57; // All EMV fields
+        uint256 emvFieldsLength = 63; // All EMV fields
         
         // Calculate modulus length first to determine signature length
         // Total length - EMV fields - exponent(3) = signature + modulus
