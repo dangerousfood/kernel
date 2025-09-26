@@ -2,43 +2,54 @@
 
 pragma solidity ^0.8.26;
 
-import {MerchantRegistry} from "./MerchantRegistry.sol";
-import {IExecutor} from "../interfaces/IERC7579Modules.sol";
+import {AcquirerConfig} from "./AcquirerConfig.sol";
 import {
     MODULE_TYPE_EXECUTOR
 } from "../types/Constants.sol";
 import {EMVTransactionData} from "./EMVValidator.sol";
 import {SafeTransferLib} from "lib/solady/src/utils/SafeTransferLib.sol";
+import {Ownable} from "lib/solady/src/auth/Ownable.sol";
 
 /**
  * @title EMVSettlement
  * @dev Handles EMV transaction settlement and ERC20 token transfers
  * @notice Processes EMV transaction data and executes corresponding token transfers
  */
-contract EMVSettlement is IExecutor {
+contract EMVSettlement is Ownable {
     // ========== EVENTS ==========
     
     event EMVTransferExecuted(
         address indexed from,
         address indexed to,
         address indexed token,
-        uint256 amount,
-        bytes4 unpredictableNumber,
-        uint16 atc
+        uint256 amount
+    );
+    
+    event EMVMultiTransferExecuted(
+        address indexed from,
+        address indexed token,
+        uint256 totalAmount,
+        uint256 recipientCount
     );
     event EMVSettlementConfigured(address indexed account, address token, address recipient);
+    event NetworkFeeRecipientUpdated(address indexed oldRecipient, address indexed newRecipient);
 
     // ========== STORAGE ==========
     
     // Immutable configuration - accessible in both regular call and delegate call contexts
     address public immutable configuredToken;      // ERC20 token address for this settlement instance
-    MerchantRegistry public immutable merchantRegistry; // Registry for merchant address validation
+    AcquirerConfig public immutable acquirerConfig; // Registry for merchant address validation
     uint8 public immutable decimals;                   // Token decimals for amount conversion
 
     // ========== CONSTRUCTOR ==========
     
-    constructor(address _tokenAddress, address _merchantRegistryAddress, uint8 _decimals) {
-        if (_tokenAddress == address(0) || _merchantRegistryAddress == address(0)) {
+    constructor(
+        address _tokenAddress, 
+        address _acquirerConfigAddress, 
+        uint8 _decimals, 
+        address _owner
+    ) {
+        if (_tokenAddress == address(0) || _acquirerConfigAddress == address(0)) {
             revert InvalidConfig();
         }
         
@@ -47,8 +58,11 @@ contract EMVSettlement is IExecutor {
         }
         
         configuredToken = _tokenAddress;
-        merchantRegistry = MerchantRegistry(_merchantRegistryAddress);
+        acquirerConfig = AcquirerConfig(_acquirerConfigAddress);
         decimals = _decimals;
+        
+        // Initialize Ownable
+        _initializeOwner(_owner);
     }
 
     // ========== ERRORS ==========
@@ -58,6 +72,12 @@ contract EMVSettlement is IExecutor {
     error MerchantRegistryNotSet();
     error InvalidConfig();
     error InvalidDecimals();
+    error InvalidNetworkFeeRate();
+    error InvalidNetworkFeeRecipient();
+    error TotalTransfersExceedAmount();
+    error InvalidFee(uint256 position);
+    error InvalidMerchantFee();
+    error BelowTransactionMinimum();
 
 
 
@@ -65,9 +85,9 @@ contract EMVSettlement is IExecutor {
 
     /**
      * @dev Install the module
-     * @param data Installation data: abi.encode(tokenAddress, merchantRegistryAddress, decimals)
+     * @param data Installation data (not used - configuration is set in constructor)
      */
-    function onInstall(bytes calldata data) external payable override {
+    function onInstall(bytes calldata data) external payable {
         // Configuration is set in constructor as immutable values
         // This function is called during module installation but config is already set
         emit EMVSettlementConfigured(msg.sender, configuredToken, address(0));
@@ -77,23 +97,23 @@ contract EMVSettlement is IExecutor {
      * @dev Uninstall the module
      * @param data Uninstallation data (not used for this contract)
      */
-    function onUninstall(bytes calldata data) external payable override {
+    function onUninstall(bytes calldata data) external payable {
         // Configuration is immutable, nothing to clean up
     }
 
     /**
      * @dev Check if module supports the given type
      */
-    function isModuleType(uint256 typeID) external pure override returns (bool) {
+    function isModuleType(uint256 typeID) external pure returns (bool) {
         return typeID == MODULE_TYPE_EXECUTOR;
     }
 
     /**
      * @dev Check if module is initialized for the smart account
      */
-    function isInitialized(address smartAccount) external view override returns (bool) {
+    function isInitialized(address smartAccount) external view returns (bool) {
         // Configuration is immutable and set in constructor, so always initialized
-        return configuredToken != address(0) && address(merchantRegistry) != address(0) && decimals >= 2;
+        return configuredToken != address(0) && address(acquirerConfig) != address(0) && decimals >= 2;
     }
 
     // ========== SETTLEMENT FUNCTIONS ==========
@@ -107,8 +127,14 @@ contract EMVSettlement is IExecutor {
         // Amount is at offset 14: ARQC(8) + UnpredictableNumber(4) + ATC(2) = 14
         bytes calldata amountBytes = emvData[14:20]; // 6 bytes for amount
         
+        // TerminalId is at offset 34: ARQC(8) + UnpredictableNumber(4) + ATC(2) + Amount(6) + Currency(2) + Date(3) + TxnType(1) + TVR(5) + CVMResults(3) = 34
+        uint64 terminalId = uint64(bytes8(emvData[34:42])); // 8 bytes for terminalId converted to uint64
+        
         // MerchantId is at offset 42: ARQC(8) + UnpredictableNumber(4) + ATC(2) + Amount(6) + Currency(2) + Date(3) + TxnType(1) + TVR(5) + CVMResults(3) + TerminalId(8) = 42
-        bytes15 merchantId = bytes15(emvData[42:57]); // 15 bytes for merchantId
+        uint120 merchantId = uint120(bytes15(emvData[42:57])); // 15 bytes for merchantId converted to uint120
+        
+        // AcquirerId is at offset 57: ARQC(8) + UnpredictableNumber(4) + ATC(2) + Amount(6) + Currency(2) + Date(3) + TxnType(1) + TVR(5) + CVMResults(3) + TerminalId(8) + MerchantId(15) = 57
+        uint48 acquirerId = uint48(bytes6(emvData[57:63])); // 6 bytes for acquirerId converted to uint48
 
         // Extract amount from EMV BCD format (6 bytes) using immutable decimals
         uint256 transferAmount = _extractAmountFromBCD(amountBytes, decimals);
@@ -117,14 +143,12 @@ contract EMVSettlement is IExecutor {
             revert InvalidAmount();
         }
         
-        address recipient = merchantRegistry.getMerchantAddress(merchantId);
+        // Get payment distribution from acquirer config (includes all 4 fees + merchant)
+        AcquirerConfig.FeeRecipient[] memory feeRecipients = 
+            acquirerConfig.calculatePaymentDistribution(merchantId, terminalId, acquirerId, transferAmount);
         
-        if (recipient == address(0)) {
-            revert MerchantNotRegistered(merchantId);
-        }
-
-        // Execute ERC20 transfer (in delegate call context, address(this) is the kernel)
-        SafeTransferLib.safeTransfer(configuredToken, recipient, transferAmount);
+        // Process payments to all recipients
+        _processFeePayments(feeRecipients, transferAmount);
     }
 
 
@@ -132,16 +156,55 @@ contract EMVSettlement is IExecutor {
     // ========== CONFIGURATION FUNCTIONS ==========
 
     /**
-     * @dev Get the configured token, merchant registry, and decimals
+     * @dev Get the configured token, acquirer config, and decimals
      * @return tokenAddress The configured ERC20 token address
-     * @return registry The merchant registry address
+     * @return configAddress The acquirer config address
      * @return tokenDecimals The configured token decimals
      */
-    function getSettlementConfig() external view returns (address tokenAddress, address registry, uint8 tokenDecimals) {
-        return (configuredToken, address(merchantRegistry), decimals);
+    function getSettlementConfig() external view returns (address tokenAddress, address configAddress, uint8 tokenDecimals) {
+        return (configuredToken, address(acquirerConfig), decimals);
     }
 
     // ========== INTERNAL FUNCTIONS ==========
+
+    /**
+     * @dev Process payments to fee recipients including fees and merchant remainder
+     * @param feeRecipients Array of fee recipients with calculated amounts
+     * @param totalAmount Total transaction amount
+     */
+    function _processFeePayments(
+        AcquirerConfig.FeeRecipient[] memory feeRecipients,
+        uint256 totalAmount
+    ) internal {
+        uint256 totalFees = 0;
+        
+        // Process all fees (excluding merchant)
+        uint256 i = 0;
+        for (; i < feeRecipients.length - 1;) {
+            // Validate non-merchant fees are non-zero
+            if (feeRecipients[i].fee == 0) revert InvalidFee(i);
+            
+            uint256 feeAmount = feeRecipients[i].fee;
+            totalFees += feeAmount;
+            
+            SafeTransferLib.safeTransfer(configuredToken, feeRecipients[i].recipient, feeAmount);
+            unchecked {
+                ++i;
+            }
+        }
+        
+        // Check if total fees exceed or equal transaction amount
+        if (totalFees >= totalAmount) revert BelowTransactionMinimum();
+        
+        // Handle merchant payment (last recipient, fee must be 0)
+        // i should now point to the last element (merchant)
+        if (feeRecipients[i].fee != 0) revert InvalidMerchantFee();
+        
+        uint256 merchantAmount = totalAmount - totalFees;
+        if (merchantAmount > 0) {
+            SafeTransferLib.safeTransfer(configuredToken, feeRecipients[i].recipient, merchantAmount);
+        }
+    }
 
     /**
      * @dev Extract amount from EMV BCD format
@@ -172,9 +235,6 @@ contract EMVSettlement is IExecutor {
         // EMV amounts are typically in cents (2 decimal places)
         // So we need to convert: cents -> token units
         // Example: If token has 18 decimals, multiply by 10^(18-2) = 10^16
-        if (tokenDecimals < 2) {
-            return 0; // Invalid decimals
-        }
         return amount * 10**(tokenDecimals - 2);
     }
 }

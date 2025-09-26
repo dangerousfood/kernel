@@ -4,7 +4,7 @@ pragma solidity ^0.8.26;
 import "./base/KernelTestBase.sol";
 import "../src/emv/EMVValidator.sol";
 import "../src/emv/EMVSettlement.sol";
-import "../src/emv/MerchantRegistry.sol";
+import "../src/emv/AcquirerConfig.sol";
 import "../src/interfaces/PackedUserOperation.sol";
 import "../src/types/Constants.sol";
 import "../src/types/Types.sol";
@@ -17,7 +17,7 @@ import {
 contract EMVValidatorTest is KernelTestBase {
     EMVValidator public emvValidator;
     EMVSettlement public emvSettlement;
-    MerchantRegistry public merchantRegistry;
+    AcquirerConfig public acquirerConfig;
     address public merchantAddress;
     
     // Event declarations for testing
@@ -32,9 +32,9 @@ contract EMVValidatorTest is KernelTestBase {
         uint16 atc
     );
     
-    // Test RSA key pair (2048-bit)
+    // Test RSA key pair (2048-bit) - Updated for new 63-byte EMV format
     bytes constant TEST_EXPONENT = hex"010001";
-    bytes constant TEST_MODULUS = hex"e1bb031f4389e26a6d2fb1eab48946263b9386667aca2a10c71fd2a81ecc76e27de78698819f86339207b24fa69b9e2cefc6db2d68f102d773b4d1e2b4d7f7c0ddbaed43b3c09ef094a1aa17873ee52542a6fa4e096744659bedbd41931739e2993dccfbd3fcc58dcfc6db5a27affc9020b38015086b4cb91829d55102f72d5b282769ff2618d168ea7c5ef3f200c69033e2e23e835617e5b86ecbadc9ff19782c5e679e35371d169ea64a8371c9a89acc50eb6f6a0851038ee725d93da77e981a1d0327d3c557253a533629cd2bf21c476a4001c76e6985902655c68a6951e74f071087c7be29bda5e25b8943c4f55eafbbbbc8beea975a746908b94b66c917";
+    bytes constant TEST_MODULUS = hex"d62d80e0419beb12fdb19eaa0f82f99728e36129058a5f97084dbc5785b771c1826249369624794af1f5c88afbcda3bbb7cf5c6a35ff5cc86ccbfba0f8218439646bf9673a3295ce09cf2cb59deb26ab0d5bea14729735c30339d6f8a9e1e09100d5497b3a6e86fad96fc01e7431fb808d71b035064d64f0fb006c6ea6100771e51da0f643d56c1d6448f4525db772e3cee3cc96647b53f314625e93579380d30b9bcad02bc564410c3cdf57414978d829128f65c478ad49abee7517d04f873e4fe90ae8d3cb052abf056f89cb1792483b7dec70129a0d7d3f10e8bcbc911224cc1a639c065d0ddc84d536089a58d14036e5f9e560754451cee3b24eedeeef49";
     
     // Test EMV data
     bytes constant TEST_ARQC = hex"1234567890ABCDEF";
@@ -48,28 +48,60 @@ contract EMVValidatorTest is KernelTestBase {
     bytes constant TEST_CVM_RESULTS = hex"000000";
     bytes constant TEST_TERMINAL_ID = hex"5445535430303100"; // "TEST001" padded to 8 bytes with null
     bytes constant TEST_MERCHANT_ID = hex"4D45524348414E5430303132333400"; // "MERCHANT001234" padded to 15 bytes with null
+    bytes constant TEST_ACQUIRER_ID = hex"414351554952"; // "ACQUIR" as 6 bytes
     
-    // Valid signature for the test data above (final corrected with proper Terminal ID and Merchant ID)
-    bytes constant TEST_SIGNATURE = hex"3b19fb77dcc923c6828f9fc7a15d36a5eb7ef7d134278aa6b3e3d72c4b2d21bf3223b084d95036abbc4d648afacbc2ec4777a0cb8844219952b979494d1c967ee0c8ec524d9b6c5ed22f5b4187c1063ee781b9d584e1377152d04eace65d0a7e07fe4372f30251790fe7f3a18427857e50a5b9f7d7dd570c7bae5acb3e965fb7ba362433cbdc65f4d6a3e78abd1ad507bd3c3f9ef36521c910f00246ffc4749ca376db8ae877a08aa97ea392a769b944aae8198681eb484509df3a38e8b07634141b6662a9946d07d95892a8351e971c00ba76ac3e0da9ae071caac6fe269c8ac5bdc718fa0e905353bb3b67bd7d9280bb8266d38b6e42a0cee19b25c61314ca";
+    // Helper functions to convert bytes to integers for AcquirerConfig interface
+    function bytesToUint48(bytes6 b) internal pure returns (uint48) {
+        return uint48(bytes6(b));
+    }
     
-    // Expected dynamic data (for reference) - updated with properly padded Terminal ID and Merchant ID
-    bytes constant EXPECTED_DYNAMIC_DATA = hex"6a031234567890abcdef123456780000000000010000034823120100000000000000000054455354303031004d45524348414e5430303132333400bc";
+    function bytesToUint64(bytes8 b) internal pure returns (uint64) {
+        return uint64(bytes8(b));
+    }
+    
+    function bytesToUint120(bytes15 b) internal pure returns (uint120) {
+        return uint120(bytes15(b));
+    }
+    
+    // Valid signature for the test data above - Updated for new 63-byte EMV format with acquirerId
+    bytes constant TEST_SIGNATURE = hex"62d99b3d032c534d6c6838f29fea2cd97b00e866a03620b4d0e9866ce1f89eab71ef2a58b560203d51fd5c222c97ecf6af6a15632c4b47fafb5bb766a6e05c35508ecf847357e4bdcaab6ba1aaff5d433797a533365832253a5879b33451681902d4da935f55883c9796107c8ab63f11344a79877a82e00a74b4e1f53446b49b8eb3b3b38cfd883996278f23f6acb3b23b8087189e5982efc500e463d06cf7ca2421fb4fef24d36b96becdd49c9b51b554924590933cf1209f3a346514b8bccbd08692a9d11b3b3af4be7acfb473086a79f8c495aff98f691b4d5315ba608f34223ca6250eb1b44aff3be194e85dff4e07c6099216d5cc3d4367dbfa9c3c683d";
+    
+    // Expected dynamic data (for reference) - updated with properly padded Terminal ID, Merchant ID, and Acquirer ID (66 bytes total)
+    bytes constant EXPECTED_DYNAMIC_DATA = hex"6a031234567890abcdef123456780000000000010000034823120100000000000000000054455354303031004d45524348414e5430303132333400414351554952bc";
 
     function setUp() public override {
         super.setUp(); // Initialize KernelTestBase
         
         // Deploy EMV components
-        merchantRegistry = new MerchantRegistry();
+        acquirerConfig = new AcquirerConfig();
         merchantAddress = makeAddr("merchant");
         
-        // Register test merchant
-        merchantRegistry.modifyMerchant(bytes15(TEST_MERCHANT_ID), merchantAddress);
+        // Set up acquirer and terminal fee recipients
+        address acquirerAddress = makeAddr("acquirer");
+        address terminalFeeRecipient = makeAddr("terminalFeeRecipient");
+        
+        // Set up acquirer and register it
+        uint48 testAcquirerId = bytesToUint48(bytes6(TEST_ACQUIRER_ID));
+        acquirerConfig.setAcquirer(testAcquirerId, address(this));  // This test contract is the acquirer
+        
+        // Configure fees for this acquirer
+        acquirerConfig.setAcquirerFee(testAcquirerId, acquirerAddress, 25);  // 0.25% acquirer fee (25 basis points, within max 30)
+        acquirerConfig.setSwipeFee(testAcquirerId, 50 * 10**16);  // $0.50 terminal fee (0.05 tokens with 18 decimals)
+        
+        // Configure global network and interchange fees
+        acquirerConfig.setNetworkFee(address(this), 15);  // 0.15% network fee
+        acquirerConfig.setInterchangeFee(address(this), 200);  // 2.00% interchange fee
+        
+        // Register merchant and terminal with this acquirer
+        acquirerConfig.setMerchant(testAcquirerId, bytesToUint120(bytes15(TEST_MERCHANT_ID)), merchantAddress);
+        acquirerConfig.setTerminal(testAcquirerId, bytesToUint64(bytes8(TEST_TERMINAL_ID)), terminalFeeRecipient);
         
         // Deploy settlement contract with configuration
         emvSettlement = new EMVSettlement(
             address(mockERC20),        // token address
-            address(merchantRegistry), // merchant registry address  
-            18                         // token decimals
+            address(acquirerConfig),   // acquirer config address  
+            18,                        // token decimals
+            address(this)              // owner
         );
         
         // Deploy EMV validator with target and selector
@@ -128,11 +160,11 @@ contract EMVValidatorTest is KernelTestBase {
                 address(emvSettlement),
                 abi.encodePacked(
                     address(0), // No hook for executor
-                    abi.encode(
-                        abi.encode(address(mockERC20), address(merchantRegistry), uint8(18)), // executor data - configure token, registry, and decimals
-                        hex"", // hook data
-                        hex"" // selector data
-                    )
+                abi.encode(
+                    abi.encode(address(mockERC20), address(acquirerConfig), uint8(18)), // executor data - configure token, registry, and decimals
+                    hex"", // hook data
+                    hex"" // selector data
+                )
                 )
             ),
             true,
@@ -156,6 +188,7 @@ contract EMVValidatorTest is KernelTestBase {
             TEST_CVM_RESULTS,             // 3 bytes
             TEST_TERMINAL_ID,             // 8 bytes
             TEST_MERCHANT_ID,             // 15 bytes
+            TEST_ACQUIRER_ID,             // 6 bytes
             TEST_SIGNATURE,               // Variable length
             TEST_EXPONENT,                // Variable length  
             TEST_MODULUS                  // Variable length
@@ -176,6 +209,7 @@ contract EMVValidatorTest is KernelTestBase {
             TEST_CVM_RESULTS,             // 3 bytes
             TEST_TERMINAL_ID,             // 8 bytes
             TEST_MERCHANT_ID,             // 15 bytes
+            TEST_ACQUIRER_ID,             // 6 bytes
             hex"deadbeef",                // Invalid signature (4 bytes instead of 256)
             TEST_EXPONENT,                // Variable length  
             TEST_MODULUS                  // Variable length
@@ -191,7 +225,7 @@ contract EMVValidatorTest is KernelTestBase {
             abi.encodePacked(
                 address(0), // No hook
                 abi.encode(
-                    abi.encode(address(mockERC20), merchantAddress, address(merchantRegistry), uint16(0)), // executor data
+                    abi.encode(address(mockERC20), merchantAddress, address(acquirerConfig), uint16(0)), // executor data
                     hex"" // hook data
                 )
             )
@@ -233,6 +267,7 @@ contract EMVValidatorTest is KernelTestBase {
             cvmResults: TEST_CVM_RESULTS,
             terminalId: TEST_TERMINAL_ID,
             merchantId: TEST_MERCHANT_ID,
+            acquirerId: TEST_ACQUIRER_ID,
             signature: TEST_SIGNATURE,
             exponent: TEST_EXPONENT,
             modulus: TEST_MODULUS
@@ -349,8 +384,11 @@ contract EMVValidatorTest is KernelTestBase {
         uint256 merchantBalance = mockERC20.balanceOf(merchantAddress);
         assertGt(merchantBalance, 0, "Merchant should have received tokens");
         
-        // The amount should be 1e20 wei (100.00 dollars worth)
-        assertEq(merchantBalance, 1e20, "Merchant should have received exactly 1e20 tokens");
+        // The amount should be 1e20 wei (100.00 dollars worth) minus all fees
+        // Fees: 0.25% acquirer (0.25) + $0.50 swipe (0.50) + 0.15% network (0.15) + 2.00% interchange (2.00) = 2.90 tokens deducted
+        // Expected merchant amount: 100 - 2.90 = 97.10 tokens = 97.10e18
+        uint256 expectedMerchantAmount = 971e17;  // 97.1 * 10^17 = 97.1e18
+        assertEq(merchantBalance, expectedMerchantAmount, "Merchant should have received 97.1 tokens after all fees");
     }
 
     function test_InvalidEMVSignature() public whenInitialized {
@@ -407,8 +445,11 @@ contract EMVValidatorTest is KernelTestBase {
         uint256 merchantBalanceAfter = mockERC20.balanceOf(merchantAddress);
         assertGt(merchantBalanceAfter, merchantBalanceBefore);
         
-        // The amount should be 100.00 dollars = 1e20 wei (based on TEST_AMOUNT)
-        assertEq(merchantBalanceAfter - merchantBalanceBefore, 1e20);
+        // The amount should be 100.00 dollars = 1e20 wei (based on TEST_AMOUNT) minus all fees
+        // Fees: 0.25% acquirer (0.25) + $0.50 swipe (0.50) + 0.15% network (0.15) + 2.00% interchange (2.00) = 2.90 tokens deducted
+        // Expected merchant amount: 100 - 2.90 = 97.10 tokens = 97.10e18
+        uint256 expectedIncrease = 971e17;  // 97.1 * 10^17 = 97.1e18
+        assertEq(merchantBalanceAfter - merchantBalanceBefore, expectedIncrease);
     }
 
     function test_DynamicDataAssembly() public view {
@@ -425,6 +466,7 @@ contract EMVValidatorTest is KernelTestBase {
             cvmResults: TEST_CVM_RESULTS,
             terminalId: TEST_TERMINAL_ID,
             merchantId: TEST_MERCHANT_ID,
+            acquirerId: TEST_ACQUIRER_ID,
             signature: TEST_SIGNATURE,
             exponent: TEST_EXPONENT,
             modulus: TEST_MODULUS
@@ -445,6 +487,7 @@ contract EMVValidatorTest is KernelTestBase {
             TEST_CVM_RESULTS,                // 9F34 - CVM Results (3 bytes)
             TEST_TERMINAL_ID,                // 9F1C - Terminal ID (8 bytes)
             TEST_MERCHANT_ID,                // 9F16 - Merchant ID (15 bytes)
+            TEST_ACQUIRER_ID,                // 9F01 - Acquirer ID (6 bytes)
             bytes1(0xBC)                     // Trailer
         );
 
@@ -524,6 +567,7 @@ contract EMVValidatorTest is KernelTestBase {
             TEST_CVM_RESULTS,             // 3 bytes
             TEST_TERMINAL_ID,             // 8 bytes
             TEST_MERCHANT_ID,             // 15 bytes
+            TEST_ACQUIRER_ID,             // 6 bytes
             rsa1024Signature,             // 128 bytes (RSA-1024 signature)
             TEST_EXPONENT,                // 3 bytes  
             rsa1024Modulus                // 128 bytes (RSA-1024 modulus - should be blocked)
@@ -569,23 +613,101 @@ contract EMVValidatorTest is KernelTestBase {
         assertTrue(emvValidator.isUnpredictableNumberUsed(address(kernel), bytes4(TEST_UNPREDICTABLE_NUMBER)), "Unpredictable number should be marked as used");
     }
 
-    // ========== MERCHANT REGISTRY TESTS ==========
+    // ========== ACQUIRER CONFIG TESTS ==========
 
-    function test_MerchantRegistryBasics() public {
-        bytes15 merchantId = bytes15(TEST_MERCHANT_ID);
+    function test_AcquirerConfigBasics() public {
+        uint48 testAcquirerId = bytesToUint48(bytes6("TESTAQ"));
+        uint120 merchantId = bytesToUint120(bytes15(TEST_MERCHANT_ID));
         address testMerchantAddress = address(0x789);
         
-        // Register merchant
-        merchantRegistry.modifyMerchant(merchantId, testMerchantAddress);
+        // Register acquirer (owner-only)
+        acquirerConfig.setAcquirer(testAcquirerId, address(this));
+        
+        // Register merchant with this acquirer
+        acquirerConfig.setMerchant(testAcquirerId, merchantId, testMerchantAddress);
         
         // Check registration
-        assertTrue(merchantRegistry.isMerchantRegistered(merchantId));
-        assertEq(merchantRegistry.getMerchantAddress(merchantId), testMerchantAddress);
+        assertTrue(acquirerConfig.isMerchantRegistered(testAcquirerId, merchantId));
+        assertEq(acquirerConfig.getMerchantAddress(testAcquirerId, merchantId), testMerchantAddress);
         
-        // Test removal by setting address to address(0)
-        merchantRegistry.modifyMerchant(merchantId, address(0));
-        assertFalse(merchantRegistry.isMerchantRegistered(merchantId));
-        assertEq(merchantRegistry.getMerchantAddress(merchantId), address(0));
+        // Test removal
+        acquirerConfig.setMerchant(testAcquirerId, merchantId, address(0));
+        assertFalse(acquirerConfig.isMerchantRegistered(testAcquirerId, merchantId));
+        assertEq(acquirerConfig.getMerchantAddress(testAcquirerId, merchantId), address(0));
+    }
+
+    function test_AcquirerAndTerminalFees() public {
+        address acquirer = makeAddr("testAcquirer");
+        address terminalRecipient = makeAddr("testTerminalRecipient");
+        uint64 testTerminalId = bytesToUint64(bytes8("TESTTERM"));
+        uint120 testMerchantId = bytesToUint120(bytes15("TESTMERCHANT123"));
+        uint48 testAcquirerId = bytesToUint48(bytes6("TESTAQ"));
+        
+        // Register acquirer (owner-only)
+        acquirerConfig.setAcquirer(testAcquirerId, address(this));
+        
+        // Set up acquirer fees
+        acquirerConfig.setAcquirerFee(testAcquirerId, acquirer, 25);  // 0.25% (within max 30)
+        
+        // Set up terminal fee
+        acquirerConfig.setSwipeFee(testAcquirerId, 1 ether);  // 1 token terminal fee
+        
+        // Register merchant and terminal with this acquirer
+        address testMerchant = makeAddr("testMerchant");
+        acquirerConfig.setMerchant(testAcquirerId, testMerchantId, testMerchant);
+        acquirerConfig.setTerminal(testAcquirerId, testTerminalId, terminalRecipient);
+        
+        // Test payment distribution calculation
+        uint256 totalAmount = 10 ether;
+        AcquirerConfig.FeeRecipient[] memory feeRecipients = acquirerConfig.calculatePaymentDistribution(
+            testMerchantId, testTerminalId, testAcquirerId, totalAmount
+        );
+        
+        // Verify fee structure (should have acquirer fee, swipe fee, and merchant)
+        assertGt(feeRecipients.length, 2);
+        
+        // Find the merchant recipient (should be last with fee=0)
+        AcquirerConfig.FeeRecipient memory merchantRecipient = feeRecipients[feeRecipients.length - 1];
+        assertEq(merchantRecipient.recipient, testMerchant);
+        assertEq(merchantRecipient.fee, 0);  // Merchant fee must be 0
+    }
+
+    function test_AcquirerConfigNotRegistered() public {
+        uint64 testTerminalId = bytesToUint64(bytes8("TESTTERM"));
+        uint120 unregisteredMerchantId = bytesToUint120(bytes15("UNREGISTERED123"));
+        uint48 unregisteredAcquirerId = bytesToUint48(bytes6("UNREG1"));
+        
+        // Test payment distribution calculation with unregistered acquirer
+        uint256 totalAmount = 10 ether;
+        
+        // Should revert with InvalidAcquirerId
+        vm.expectRevert(AcquirerConfig.InvalidAcquirerId.selector);
+        acquirerConfig.calculatePaymentDistribution(unregisteredMerchantId, testTerminalId, unregisteredAcquirerId, totalAmount);
+    }
+
+    function test_FallbackToFeeRecipient() public {
+        uint48 testAcquirerId = bytesToUint48(bytes6("TESTAQ"));
+        uint120 unregisteredMerchantId = bytesToUint120(bytes15("UNREG_MERCHANT"));
+        uint64 unregisteredTerminalId = bytesToUint64(bytes8("UNREG_TM"));
+        address feeRecipient = makeAddr("feeRecipient");
+        
+        // Register acquirer and set fee recipient
+        acquirerConfig.setAcquirer(testAcquirerId, address(this));
+        acquirerConfig.setAcquirerFee(testAcquirerId, feeRecipient, 25);
+        
+        // Test payment distribution with unregistered merchant/terminal (should fallback to feeRecipient)
+        uint256 totalAmount = 10 ether;
+        AcquirerConfig.FeeRecipient[] memory feeRecipients = acquirerConfig.calculatePaymentDistribution(
+            unregisteredMerchantId, unregisteredTerminalId, testAcquirerId, totalAmount
+        );
+        
+        // Should have at least the merchant entry (using feeRecipient as fallback)
+        assertGt(feeRecipients.length, 0);
+        
+        // Last recipient should be the merchant (using feeRecipient as fallback)
+        AcquirerConfig.FeeRecipient memory merchantRecipient = feeRecipients[feeRecipients.length - 1];
+        assertEq(merchantRecipient.recipient, feeRecipient, "Should fallback to feeRecipient for unregistered merchant");
+        assertEq(merchantRecipient.fee, 0, "Merchant fee must be 0");
     }
 
 }
