@@ -108,6 +108,69 @@ contract AcquirerConfig is Ownable {
         _initializeOwner(msg.sender);
     }
 
+    // ========== INTERNAL FUNCTIONS ==========
+
+    /**
+     * @dev Add fee to array or accumulate if recipient already exists
+     * @param feeRecipients The fee recipients array
+     * @param index Current index in the array (will be incremented if new recipient added)
+     * @param recipient The fee recipient address
+     * @param feeAmount The fee amount to add or accumulate
+     */
+    function _addOrAccumulateFee(
+        FeeRecipient[] memory feeRecipients,
+        uint256 index,
+        address recipient,
+        uint256 feeAmount
+    ) internal returns (uint256 newIndex) {
+        if (recipient == address(0)) revert InvalidFee(index);
+        
+        // Check if recipient already exists using transient storage
+        uint256 existingIndex;
+        assembly {
+            existingIndex := tload(recipient)
+        }
+        
+        if (existingIndex == 0) {
+            // New recipient - store index + 1 in transient storage (0 means not found)
+            assembly {
+                tstore(recipient, add(index, 1))
+            }
+            feeRecipients[index] = FeeRecipient({
+                fee: feeAmount,
+                recipient: recipient
+            });
+            return index + 1;
+        } else {
+            // Existing recipient - accumulate fee (existingIndex is 1-based)
+            feeRecipients[existingIndex - 1].fee += feeAmount;
+            return index; // Don't increment index
+        }
+    }
+
+    /**
+     * @dev Clear transient storage for all fee recipients (internal version)
+     * @param feeRecipients The fee recipients array
+     * @param length Number of recipients to clear (excluding merchant)
+     */
+    function _clearTransientStorage(FeeRecipient[] memory feeRecipients, uint256 length) internal {
+        for (uint256 i = 0; i < length; i++) {
+            address recipient = feeRecipients[i].recipient;
+            assembly {
+                tstore(recipient, 0)
+            }
+        }
+    }
+
+    /**
+     * @dev Clear transient storage for all fee recipients (public version)
+     * @param feeRecipients The fee recipients array
+     * @param length Number of recipients to clear
+     */
+    function clearTransientStorage(FeeRecipient[] memory feeRecipients, uint256 length) external {
+        _clearTransientStorage(feeRecipients, length);
+    }
+
     // ========== OWNER FUNCTIONS ==========
 
     /**
@@ -425,7 +488,7 @@ contract AcquirerConfig is Ownable {
         uint64 terminalId,
         uint48 acquirerId,
         uint256 totalAmount
-    ) external view returns (FeeRecipient[] memory feeRecipients) {
+    ) external returns (FeeRecipient[] memory feeRecipients) {
         // Validate acquirer is registered
         if (acquirerAddresses[acquirerId] == address(0))
             revert InvalidAcquirerId();
@@ -434,6 +497,10 @@ contract AcquirerConfig is Ownable {
         address acquirerFeeRecipient = acquirerData[acquirerId].acquirerFeeRecipient;
         uint256 acquirerFeeRate = acquirerData[acquirerId].acquirerFeeRate;
         uint256 swipeFee = acquirerData[acquirerId].swipeFee;
+        
+        // Cache global fee recipients to local variables for assembly use
+        address _interchangeFeeRecipient = interchangeFeeRecipient;
+        address _networkFeeRecipient = networkFeeRecipient;
 
         // Get merchant and terminal addresses, fallback to feeRecipient if not registered
         address merchantAddress = acquirerData[acquirerId].merchants[merchantId];
@@ -457,53 +524,25 @@ contract AcquirerConfig is Ownable {
 
         // Add acquirer fee if non-zero
         if (acquirerFeeAmount > 0) {
-            if (acquirerFeeRecipient == address(0))
-                revert InvalidFee(index);
-            feeRecipients[index] = FeeRecipient({
-                fee: acquirerFeeAmount,
-                recipient: acquirerFeeRecipient
-            });
-            unchecked {
-                ++index;
-            }
+            index = _addOrAccumulateFee(feeRecipients, index, acquirerFeeRecipient, acquirerFeeAmount);
         }
 
         // Add swipe fee if non-zero (per-acquirer swipe fee)
         if (swipeFee > 0) {
-            feeRecipients[index] = FeeRecipient({
-                fee: swipeFee,
-                recipient: terminalAddress
-            });
-            unchecked {
-                ++index;
-            }
+            index = _addOrAccumulateFee(feeRecipients, index, terminalAddress, swipeFee);
         }
 
         // Add interchange fee if non-zero
         if (interchangeFeeAmount > 0) {
-            if (interchangeFeeRecipient == address(0)) revert InvalidFee(index);
-            feeRecipients[index] = FeeRecipient({
-                fee: interchangeFeeAmount,
-                recipient: interchangeFeeRecipient
-            });
-            unchecked {
-                ++index;
-            }
+            index = _addOrAccumulateFee(feeRecipients, index, _interchangeFeeRecipient, interchangeFeeAmount);
         }
 
         // Add network fee if non-zero
         if (networkFeeAmount > 0) {
-            if (networkFeeRecipient == address(0)) revert InvalidFee(index);
-            feeRecipients[index] = FeeRecipient({
-                fee: networkFeeAmount,
-                recipient: networkFeeRecipient
-            });
-            unchecked {
-                ++index;
-            }
+            index = _addOrAccumulateFee(feeRecipients, index, _networkFeeRecipient, networkFeeAmount);
         }
 
-        // Add merchant (always last, fee must be 0)
+        // Add merchant (always last, fee must be 0) - no deduplication for merchant
         feeRecipients[index] = FeeRecipient({
             fee: 0, // Merchant fee must be 0
             recipient: merchantAddress
@@ -511,6 +550,9 @@ contract AcquirerConfig is Ownable {
         unchecked {
             ++index;
         }
+
+        // Clean up transient storage before returning (exclude merchant)
+        _clearTransientStorage(feeRecipients, index - 1);
 
         // Resize array to actual number of recipients
         assembly {

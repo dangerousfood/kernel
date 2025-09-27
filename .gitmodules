@@ -10,3 +10,6 @@
 [submodule "lib/SolRsaVerify"]
 	path = lib/SolRsaVerify
 	url = https://github.com/adria0/SolRsaVerify
+[submodule "lib/transient-bytes"]
+	path = lib/transient-bytes
+	url = https://github.com/dangerousfood/transient-bytes
