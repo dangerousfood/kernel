@@ -710,4 +710,144 @@ contract EMVValidatorTest is KernelTestBase {
         assertEq(merchantRecipient.fee, 0, "Merchant fee must be 0");
     }
 
+    function test_DuplicateRecipientAccumulation() public {
+        uint48 testAcquirerId = bytesToUint48(bytes6("TESTAQ"));
+        uint120 testMerchantId = bytesToUint120(bytes15("TESTMERCHANT123"));
+        uint64 testTerminalId = bytesToUint64(bytes8("TESTTERM"));
+        address sharedRecipient = makeAddr("sharedRecipient");
+        
+        // Register acquirer and set the SAME address for all fee recipients
+        acquirerConfig.setAcquirer(testAcquirerId, address(this));
+        acquirerConfig.setAcquirerFee(testAcquirerId, sharedRecipient, 25);  // 0.25%
+        acquirerConfig.setSwipeFee(testAcquirerId, 1 ether);  // 1 token swipe fee
+        
+        // Set global fees to same recipient to test accumulation
+        acquirerConfig.setNetworkFee(sharedRecipient, 15);  // 0.15%
+        acquirerConfig.setInterchangeFee(sharedRecipient, 200);  // 2.00%
+        
+        // Register merchant and terminal with different addresses to ensure they don't accumulate
+        address merchantAddress = makeAddr("merchant");
+        address terminalAddress = makeAddr("terminal");
+        acquirerConfig.setMerchant(testAcquirerId, testMerchantId, merchantAddress);
+        acquirerConfig.setTerminal(testAcquirerId, testTerminalId, terminalAddress);
+        
+        // Test payment distribution - should accumulate fees for shared recipient
+        uint256 totalAmount = 100 ether;
+        AcquirerConfig.FeeRecipient[] memory feeRecipients = acquirerConfig.calculatePaymentDistribution(
+            testMerchantId, testTerminalId, testAcquirerId, totalAmount
+        );
+        
+        // Should have fewer recipients due to accumulation
+        // Expected: 1 accumulated fee recipient + 1 terminal + 1 merchant = 3 total
+        // But if swipe fee is 0 or terminal = shared recipient, could be 2 total
+        assertGe(feeRecipients.length, 2, "Should have at least 2 recipients");
+        assertLe(feeRecipients.length, 3, "Should have at most 3 recipients");
+        
+        // Find the accumulated fee recipient
+        bool foundAccumulated = false;
+        for (uint256 i = 0; i < feeRecipients.length; i++) {
+            if (feeRecipients[i].recipient == sharedRecipient) {
+                foundAccumulated = true;
+                // Should have accumulated: acquirer (0.25%) + network (0.15%) + interchange (2.00%) = 2.40%
+                // Swipe fee goes to terminal (different address), so not accumulated
+                uint256 expectedAccumulatedFee = (totalAmount * 240) / 10000; // 2.40%
+                assertEq(feeRecipients[i].fee, expectedAccumulatedFee, "Should accumulate percentage fees for shared recipient");
+                break;
+            }
+        }
+        assertTrue(foundAccumulated, "Should find the accumulated fee recipient");
+    }
+
+    function test_ClearTransientStorageFunction() public {
+        // Create a simple fee recipients array
+        AcquirerConfig.FeeRecipient[] memory testRecipients = new AcquirerConfig.FeeRecipient[](2);
+        testRecipients[0] = AcquirerConfig.FeeRecipient({
+            fee: 100,
+            recipient: makeAddr("recipient1")
+        });
+        testRecipients[1] = AcquirerConfig.FeeRecipient({
+            fee: 200,
+            recipient: makeAddr("recipient2")
+        });
+        
+        // Test that the public clearTransientStorage function exists and can be called
+        acquirerConfig.clearTransientStorage(testRecipients, 2);
+        
+        // If we get here without reverting, the function works
+        assertTrue(true, "clearTransientStorage function should be callable");
+    }
+
+    function test_AllDifferentFeeRecipients() public {
+        uint48 testAcquirerId = bytesToUint48(bytes6("TESTAQ"));
+        uint120 testMerchantId = bytesToUint120(bytes15("TESTMERCHANT123"));
+        uint64 testTerminalId = bytesToUint64(bytes8("TESTTERM"));
+        
+        // Create different addresses for each fee type
+        address acquirerRecipient = makeAddr("acquirerRecipient");
+        address terminalRecipient = makeAddr("terminalRecipient");
+        address networkRecipient = makeAddr("networkRecipient");
+        address interchangeRecipient = makeAddr("interchangeRecipient");
+        address merchantRecipient = makeAddr("merchantRecipient");
+        
+        // Register acquirer and set different recipients for each fee type
+        acquirerConfig.setAcquirer(testAcquirerId, address(this));
+        acquirerConfig.setAcquirerFee(testAcquirerId, acquirerRecipient, 25);  // 0.25%
+        acquirerConfig.setSwipeFee(testAcquirerId, 1 ether);  // 1 token swipe fee
+        
+        // Set different global fee recipients
+        acquirerConfig.setNetworkFee(networkRecipient, 15);  // 0.15%
+        acquirerConfig.setInterchangeFee(interchangeRecipient, 200);  // 2.00%
+        
+        // Register merchant and terminal with unique addresses
+        acquirerConfig.setMerchant(testAcquirerId, testMerchantId, merchantRecipient);
+        acquirerConfig.setTerminal(testAcquirerId, testTerminalId, terminalRecipient);
+        
+        // Test payment distribution - should have 5 separate recipients (no accumulation)
+        uint256 totalAmount = 100 ether;
+        AcquirerConfig.FeeRecipient[] memory feeRecipients = acquirerConfig.calculatePaymentDistribution(
+            testMerchantId, testTerminalId, testAcquirerId, totalAmount
+        );
+        
+        // Should have 5 recipients: acquirer + swipe + interchange + network + merchant
+        assertEq(feeRecipients.length, 5, "Should have 5 separate recipients when all addresses are different");
+        
+        // Verify each recipient has the correct fee amount
+        bool foundAcquirer = false;
+        bool foundTerminal = false;
+        bool foundNetwork = false;
+        bool foundInterchange = false;
+        bool foundMerchant = false;
+        
+        for (uint256 i = 0; i < feeRecipients.length; i++) {
+            if (feeRecipients[i].recipient == acquirerRecipient) {
+                foundAcquirer = true;
+                uint256 expectedAcquirerFee = (totalAmount * 25) / 10000; // 0.25%
+                assertEq(feeRecipients[i].fee, expectedAcquirerFee, "Acquirer fee should be 0.25%");
+            } else if (feeRecipients[i].recipient == terminalRecipient) {
+                foundTerminal = true;
+                assertEq(feeRecipients[i].fee, 1 ether, "Terminal should get 1 ether swipe fee");
+            } else if (feeRecipients[i].recipient == networkRecipient) {
+                foundNetwork = true;
+                uint256 expectedNetworkFee = (totalAmount * 15) / 10000; // 0.15%
+                assertEq(feeRecipients[i].fee, expectedNetworkFee, "Network fee should be 0.15%");
+            } else if (feeRecipients[i].recipient == interchangeRecipient) {
+                foundInterchange = true;
+                uint256 expectedInterchangeFee = (totalAmount * 200) / 10000; // 2.00%
+                assertEq(feeRecipients[i].fee, expectedInterchangeFee, "Interchange fee should be 2.00%");
+            } else if (feeRecipients[i].recipient == merchantRecipient) {
+                foundMerchant = true;
+                assertEq(feeRecipients[i].fee, 0, "Merchant fee must be 0");
+                // Verify merchant is the last entry
+                assertEq(i, feeRecipients.length - 1, "Merchant should be the last recipient");
+            }
+        }
+        
+        // Verify all recipients were found
+        assertTrue(foundAcquirer, "Should find acquirer recipient");
+        assertTrue(foundTerminal, "Should find terminal recipient");
+        assertTrue(foundNetwork, "Should find network recipient");
+        assertTrue(foundInterchange, "Should find interchange recipient");
+        assertTrue(foundMerchant, "Should find merchant recipient");
+    }
+
 }

@@ -1,0 +1,14 @@
+{
+  "lib/ExcessivelySafeCall": {
+    "rev": "81cd99ce3e69117d665d7601c330ea03b97acce0"
+  },
+  "lib/SolRsaVerify": {
+    "rev": "5ceedba31ba196b4bf53c8e2a452903ddb5b76e8"
+  },
+  "lib/forge-std": {
+    "rev": "d3db4ef90a72b7d24aa5a2e5c649593eaef7801d"
+  },
+  "lib/solady": {
+    "rev": "3f2f5345261904463f5429c9031c3d2185c0f4fe"
+  }
+}
